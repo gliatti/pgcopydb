@@ -149,7 +149,6 @@ static CommandLine copy_blobs_command =
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
 		"  --large-objects-jobs Number of concurrent Large Objects jobs to run\n"
-		"  --drop-if-exists     On the target database, drop and create large objects\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
 		"  --not-consistent     Allow taking a new snapshot on the source database\n"

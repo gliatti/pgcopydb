@@ -70,6 +70,7 @@ static bool pg_copy_send_query(PGSQL *pgsql, CopyArgs *args,
 static void pgcopy_log_error(PGSQL *pgsql, PGresult *res, const char *context);
 
 static void getSequenceValue(void *ctx, PGresult *result);
+static void parseLargeObjectMetadata(void *ctx, PGresult *result);
 
 static void pgsql_stream_log_error(PGSQL *pgsql,
 								   PGresult *res, const char *message);
@@ -3495,17 +3496,19 @@ pgsql_set_gucs(PGSQL *pgsql, GUC *settings)
  * into the dst database. The copy includes re-using the same OID for the large
  * objects on both sides.
  *
+ * The schema dump is done with `pg_dump --no-blobs` so the large objects are
+ * never created by the pre-data section of the dump: this function always
+ * creates the large object on the target database, dropping it first when it
+ * already exists (e.g. when resuming a previous run).
+ *
  * When restoreOwner is true and rolname is a non-empty (already quoted)
- * identifier, the large object ownership is also restored on the target. This
- * is only necessary on the PG17+ path where pgcopydb creates the large object
- * itself via lo_create(): the object is then owned by the connecting role,
- * whereas on PG16 and earlier the pre-data restore recreates it with the
- * original owner. See the version split documented below.
+ * identifier, the large object ownership is also restored on the target:
+ * pgcopydb creates the large object itself via lo_create(), so the object is
+ * initially owned by the connecting role.
  */
 bool
 pg_copy_large_object(PGSQL *src,
 					 PGSQL *dst,
-					 bool dropIfExists,
 					 bool restoreOwner,
 					 uint32_t blobOid,
 					 const char *rolname,
@@ -3534,254 +3537,76 @@ pg_copy_large_object(PGSQL *src,
 	}
 
 	/*
-	 * Both lo_open() and lo_unlink() call ereport(ERROR) — aborting the
-	 * current transaction — when the target large object does not exist.
-	 * This is true for all PostgreSQL versions: inv_open() checks
-	 * LargeObjectExistsWithSnapshot() and LargeObjectDrop() scans
-	 * pg_largeobject_metadata, both throwing ERROR if the OID is absent.
-	 *
-	 * Whether those errors can actually be triggered depends on whether
-	 * the blobs have been created on the target before this function runs.
-	 *
-	 * In PostgreSQL 16 and earlier, pg_dump emits "BLOB" TOC entries in
-	 * SECTION_PRE_DATA containing "SELECT pg_catalog.lo_create(N)" for
-	 * every large object.  pgcopydb restores those in the pre-data step,
-	 * so by the time pg_copy_large_object() is called the blobs always
-	 * exist on the target.  lo_open() and lo_unlink() therefore never
-	 * encounter missing objects, and no special handling is needed.
-	 *
-	 * In PostgreSQL 17+, commit a45c78e3284 moved blob creation into
-	 * "BLOB METADATA" TOC entries placed in SECTION_DATA (not pre-data).
-	 * pgcopydb only restores the pre-data section, so blobs are never
-	 * pre-created.  pg_copy_large_object() must therefore create each
-	 * blob itself before opening it for writing, and must handle the
-	 * drop-if-exists case without calling lo_unlink() on absent blobs.
-	 *
-	 * For PG17+ we use SQL-level checks via pg_largeobject_metadata —
-	 * the same technique that pg_restore's own DropLOIfExists() has used
-	 * since PostgreSQL 9.0 (src/bin/pg_dump/pg_backup_db.c).
-	 *
-	 * PQserverVersion() reads the version from the connection struct;
-	 * it is an O(1) operation with no network round-trip.
-	 */
-	bool dstIsPG17orLater = PQserverVersion(dst->connection) >= 170000;
-
-	/*
 	 * 2. Drop/Create the blob on the target database.
 	 *
-	 *    When using --drop-if-exists, we first try to unlink the
-	 *    target large object, then copy the data all over again.
+	 *    The large objects are not part of the schema dump (--no-blobs),
+	 *    so we always create the target large object ourselves, dropping
+	 *    it first when it already exists (e.g. when resuming a previous
+	 *    run, or when the target database already had that OID in use).
 	 *
-	 *    In normal cases `pg_dump --section=pre-data` outputs the
-	 *    large object metadata and we only have to take care of the
-	 *    contents of the large objects.
+	 *    Calling lo_unlink() on a missing blob would reach
+	 *    LargeObjectDrop() which calls ereport(ERROR), aborting the
+	 *    transaction.  Instead, use a WHERE-filtered SELECT so that
+	 *    lo_unlink() is only called when the row actually exists.  This
+	 *    is the same pattern used by pg_restore's own DropLOIfExists().
 	 */
-	if (dropIfExists)
+	char sql[BUFSIZE] = { 0 };
+
+	sformat(sql, sizeof(sql),
+			"SELECT lo_unlink(oid) "
+			"FROM pg_largeobject_metadata "
+			"WHERE oid = %u",
+			blobOid);
+
+	if (!pgsql_execute(dst, sql))
 	{
-		if (dstIsPG17orLater)
-		{
-			/*
-			 * On PG17+, blobs are not pre-created by the pre-data
-			 * restore, so the blob may not exist yet.  Calling
-			 * lo_unlink() on a missing blob would reach LargeObjectDrop()
-			 * which calls ereport(ERROR), aborting the transaction.
-			 *
-			 * Instead, use a WHERE-filtered SELECT so that lo_unlink()
-			 * is only called when the row actually exists.  This is the
-			 * same pattern used by pg_restore's own DropLOIfExists().
-			 */
-			char sql[BUFSIZE] = { 0 };
+		log_error("Failed to delete large object %u", blobOid);
 
-			sformat(sql, sizeof(sql),
-					"SELECT lo_unlink(oid) "
-					"FROM pg_largeobject_metadata "
-					"WHERE oid = %u",
-					blobOid);
+		lo_close(src->connection, srcfd);
+		pgsql_finish(src);
+		pgsql_finish(dst);
+		return false;
+	}
 
-			if (!pgsql_execute(dst, sql))
-			{
-				lo_close(src->connection, srcfd);
-				pgsql_finish(src);
-				pgsql_finish(dst);
-				return false;
-			}
-		}
-		else
-		{
-			/*
-			 * On PG16 and earlier, pg_dump places blob creation in the
-			 * pre-data section, so blobs are always present on the target
-			 * before this function runs.  lo_unlink() therefore always
-			 * finds the blob and succeeds.
-			 */
-			if (!lo_unlink(dst->connection, blobOid))
-			{
-				log_debug("Failed to delete large object %u", blobOid);
-			}
-		}
+	Oid dstBlobOid = lo_create(dst->connection, blobOid);
 
-		Oid dstBlobOid = lo_create(dst->connection, blobOid);
+	if (dstBlobOid != blobOid)
+	{
+		char context[BUFSIZE] = { 0 };
 
-		if (dstBlobOid != blobOid)
-		{
-			char context[BUFSIZE] = { 0 };
+		sformat(context, sizeof(context),
+				"Failed to create large object %u", blobOid);
 
-			sformat(context, sizeof(context),
-					"Failed to create large object %u", blobOid);
+		(void) pgcopy_log_error(dst, NULL, context);
 
-			(void) pgcopy_log_error(dst, NULL, context);
+		lo_close(src->connection, srcfd);
 
-			lo_close(src->connection, srcfd);
+		pgsql_finish(src);
+		pgsql_finish(dst);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
-
-			return false;
-		}
+		return false;
 	}
 
 	/*
-	 * 3. Open the blob on the target database.
-	 *
-	 *    On PG17+, blobs are not pre-created by the pre-data restore (see
-	 *    comment above), so we must create the blob here if it does not
-	 *    exist yet.  We check via pg_largeobject_metadata first because
-	 *    calling lo_open() on an absent blob would call ereport(ERROR) in
-	 *    inv_open() and abort the current transaction.
-	 *
-	 *    On PG16 and earlier, blob creation happens in the pre-data
-	 *    section, so the blob always exists on the target by the time we
-	 *    reach this point.  lo_open() succeeds directly and the fallback
-	 *    create path is never exercised.
+	 * 3. Open the blob on the target database, it was just created.
 	 */
-	int dstfd = -1;
+	int dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
 
-	if (dstIsPG17orLater)
+	if (dstfd == -1)
 	{
-		SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
-		char sql[BUFSIZE] = { 0 };
+		char context[BUFSIZE] = { 0 };
 
-		sformat(sql, sizeof(sql),
-				"SELECT EXISTS("
-				"SELECT 1 FROM pg_largeobject_metadata WHERE oid = %u"
-				")",
-				blobOid);
+		sformat(context, sizeof(context),
+				"Failed to open large object %u on target", blobOid);
 
-		if (!pgsql_execute_with_params(dst, sql, 0, NULL, NULL,
-									   &context, &parseSingleValueResult))
-		{
-			lo_close(src->connection, srcfd);
-			pgsql_finish(src);
-			pgsql_finish(dst);
-			return false;
-		}
+		(void) pgcopy_log_error(dst, NULL, context);
 
-		if (!context.parsedOk)
-		{
-			log_error("Failed to check existence of large object %u on target",
-					  blobOid);
+		lo_close(src->connection, srcfd);
 
-			lo_close(src->connection, srcfd);
-			pgsql_finish(src);
-			pgsql_finish(dst);
-			return false;
-		}
+		pgsql_finish(src);
+		pgsql_finish(dst);
 
-		if (!context.boolVal)
-		{
-			log_debug("Large object %u not found on target, creating it", blobOid);
-
-			Oid createdOid = lo_create(dst->connection, blobOid);
-
-			if (createdOid != blobOid)
-			{
-				char ctx[BUFSIZE] = { 0 };
-
-				sformat(ctx, sizeof(ctx),
-						"Failed to create large object %u on target", blobOid);
-
-				(void) pgcopy_log_error(dst, NULL, ctx);
-
-				lo_close(src->connection, srcfd);
-
-				pgsql_finish(src);
-				pgsql_finish(dst);
-
-				return false;
-			}
-		}
-
-		dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
-
-		if (dstfd == -1)
-		{
-			char ctx[BUFSIZE] = { 0 };
-
-			sformat(ctx, sizeof(ctx),
-					"Failed to open large object %u on target", blobOid);
-
-			(void) pgcopy_log_error(dst, NULL, ctx);
-
-			lo_close(src->connection, srcfd);
-
-			pgsql_finish(src);
-			pgsql_finish(dst);
-
-			return false;
-		}
-	}
-	else
-	{
-		/*
-		 * PG16 and earlier: blobs are always pre-created by the pre-data
-		 * restore, so lo_open() succeeds directly.  The fallback create
-		 * path below is a safety net that is not expected to be reached
-		 * in normal operation.
-		 */
-		dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
-
-		if (dstfd == -1)
-		{
-			log_debug("Large object %u not found on target, creating it", blobOid);
-
-			Oid createdOid = lo_create(dst->connection, blobOid);
-
-			if (createdOid != blobOid)
-			{
-				char ctx[BUFSIZE] = { 0 };
-
-				sformat(ctx, sizeof(ctx),
-						"Failed to create large object %u on target", blobOid);
-
-				(void) pgcopy_log_error(dst, NULL, ctx);
-
-				lo_close(src->connection, srcfd);
-
-				pgsql_finish(src);
-				pgsql_finish(dst);
-
-				return false;
-			}
-
-			dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
-
-			if (dstfd == -1)
-			{
-				char ctx[BUFSIZE] = { 0 };
-
-				sformat(ctx, sizeof(ctx),
-						"Failed to open newly created large object %u", blobOid);
-
-				(void) pgcopy_log_error(dst, NULL, ctx);
-
-				lo_close(src->connection, srcfd);
-
-				pgsql_finish(src);
-				pgsql_finish(dst);
-
-				return false;
-			}
-		}
+		return false;
 	}
 
 	/*
@@ -3863,21 +3688,16 @@ pg_copy_large_object(PGSQL *src,
 	/*
 	 * 5. Restore the large object ownership on the target.
 	 *
-	 *    Only needed on PG17+, where we created the large object above via
-	 *    lo_create() and it is therefore owned by the connecting role. On
-	 *    PG16 and earlier the pre-data restore recreated the object with its
-	 *    original owner, so there is nothing to do (and we skip the ALTER to
-	 *    avoid a needless round-trip per large object).
+	 *    We created the large object above via lo_create() and it is
+	 *    therefore owned by the connecting role.
 	 *
 	 *    rolname is already a quoted identifier (format('%I', ...) computed on
 	 *    the source); an empty string means the owner could not be determined,
 	 *    in which case we leave the object owned by the connecting role rather
 	 *    than emit invalid SQL.
 	 */
-	if (dstIsPG17orLater && restoreOwner && rolname != NULL && rolname[0] != '\0')
+	if (restoreOwner && rolname != NULL && rolname[0] != '\0')
 	{
-		char sql[BUFSIZE] = { 0 };
-
 		sformat(sql, sizeof(sql),
 				"ALTER LARGE OBJECT %u OWNER TO %s",
 				blobOid,
@@ -3897,6 +3717,193 @@ pg_copy_large_object(PGSQL *src,
 	}
 
 	return true;
+}
+
+
+typedef struct LargeObjectMetadataContext
+{
+	char sqlstate[SQLSTATE_LENGTH];
+	bool parsedOk;
+	char *aclSQL;               /* ready-to-run REVOKE/GRANT script, or NULL */
+	char *commentSQL;           /* ready-to-run COMMENT command, or NULL */
+} LargeObjectMetadataContext;
+
+
+/*
+ * pg_copy_large_object_metadata copies the metadata of the given large object
+ * (ACL and comment) from the src database to the dst database, replacing what
+ * `pg_restore` would have done when the large objects were part of the
+ * pre-data section of the dump. The ownership of the large object is restored
+ * in pg_copy_large_object() already.
+ *
+ * Note that SECURITY LABEL ON LARGE OBJECT is not covered here.
+ */
+bool
+pg_copy_large_object_metadata(PGSQL *src,
+							  PGSQL *dst,
+							  bool noACL,
+							  bool noComments,
+							  uint32_t blobOid)
+{
+	LargeObjectMetadataContext context = { 0 };
+
+	/*
+	 * Have the source server build ready-to-run SQL commands for the ACL and
+	 * the comment of the large object, using format() with %L and regrole
+	 * casts (which apply quote_ident) so that all the quoting of literals and
+	 * identifiers is done server-side.
+	 *
+	 * When lomacl is non-NULL, first REVOKE ALL from both PUBLIC and the
+	 * owner to reset the ACL to empty, then GRANT each aclexplode() entry:
+	 * this reproduces the source ACL exactly, including the case where the
+	 * owner revoked (some of) its own default privileges.
+	 */
+	char *sql =
+		"select case when m.lomacl is null then null "
+		"            else pg_catalog.format("
+		"                   'REVOKE ALL ON LARGE OBJECT %s FROM PUBLIC, %s;', "
+		"                   m.oid, "
+		"                   m.lomowner::pg_catalog.regrole::pg_catalog.text) "
+		"              || coalesce("
+		"                   (select pg_catalog.string_agg("
+		"                             pg_catalog.format("
+		"                               'GRANT %s ON LARGE OBJECT %s TO %s%s;', "
+		"                               a.privilege_type, "
+		"                               m.oid, "
+		"                               case when a.grantee = 0 then 'PUBLIC' "
+		"                                    else a.grantee"
+		"                                         ::pg_catalog.regrole"
+		"                                         ::pg_catalog.text "
+		"                                end, "
+		"                               case when a.is_grantable "
+		"                                    then ' WITH GRANT OPTION' "
+		"                                    else '' "
+		"                                end), "
+		"                             E'\\n') "
+		"                      from pg_catalog.aclexplode(m.lomacl) as a), "
+		"                   '') "
+		"        end as acl_sql, "
+
+		"       case when d.description is null then null "
+		"            else pg_catalog.format("
+		"                   'COMMENT ON LARGE OBJECT %s IS %L;', "
+		"                   m.oid, d.description) "
+		"        end as comment_sql "
+
+		"  from pg_largeobject_metadata m "
+		"       left join pg_catalog.pg_description d "
+		"              on d.classoid = "
+		"                 'pg_catalog.pg_largeobject'::pg_catalog.regclass "
+		"             and d.objoid = m.oid "
+		" where m.oid = $1";
+
+	int paramCount = 1;
+	const Oid paramTypes[1] = { OIDOID };
+	const char *paramValues[1] = { intToString(blobOid).strValue };
+
+	if (!pgsql_execute_with_params(src, sql,
+								   paramCount, paramTypes, paramValues,
+								   &context, &parseLargeObjectMetadata))
+	{
+		log_error("Failed to fetch metadata for large object %u", blobOid);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to fetch metadata for large object %u, "
+				  "see above for details",
+				  blobOid);
+		return false;
+	}
+
+	PQExpBuffer commands = createPQExpBuffer();
+
+	if (commands == NULL)
+	{
+		log_error("Failed to allocate a PQExpBuffer for large object metadata");
+		return false;
+	}
+
+	if (!noACL && context.aclSQL != NULL)
+	{
+		appendPQExpBuffer(commands, "%s\n", context.aclSQL);
+	}
+
+	if (!noComments && context.commentSQL != NULL)
+	{
+		appendPQExpBuffer(commands, "%s\n", context.commentSQL);
+	}
+
+	if (PQExpBufferBroken(commands))
+	{
+		log_error("Failed to build metadata commands for large object %u: "
+				  "out of memory",
+				  blobOid);
+		destroyPQExpBuffer(commands);
+		return false;
+	}
+
+	/* most large objects have no metadata of their own: nothing to run */
+	bool success = true;
+
+	if (commands->len > 0)
+	{
+		success = pgsql_execute(dst, commands->data);
+
+		if (!success)
+		{
+			log_error("Failed to copy metadata for large object %u, "
+					  "see above for details",
+					  blobOid);
+		}
+	}
+
+	destroyPQExpBuffer(commands);
+
+	return success;
+}
+
+
+/*
+ * parseLargeObjectMetadata parses the result of the large object metadata
+ * query: a single row with the pre-built ACL and COMMENT SQL commands, both
+ * of which might be NULL.
+ */
+static void
+parseLargeObjectMetadata(void *ctx, PGresult *result)
+{
+	LargeObjectMetadataContext *context = (LargeObjectMetadataContext *) ctx;
+
+	if (PQntuples(result) != 1)
+	{
+		log_error("Query returned %d rows, expected 1", PQntuples(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	if (PQnfields(result) != 2)
+	{
+		log_error("Query returned %d columns, expected 2", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	context->aclSQL =
+		PQgetisnull(result, 0, 0) ? NULL : strdup(PQgetvalue(result, 0, 0));
+
+	context->commentSQL =
+		PQgetisnull(result, 0, 1) ? NULL : strdup(PQgetvalue(result, 0, 1));
+
+	if ((!PQgetisnull(result, 0, 0) && context->aclSQL == NULL) ||
+		(!PQgetisnull(result, 0, 1) && context->commentSQL == NULL))
+	{
+		log_error("Failed to allocate memory for large object metadata");
+		context->parsedOk = false;
+		return;
+	}
+
+	context->parsedOk = true;
 }
 
 
