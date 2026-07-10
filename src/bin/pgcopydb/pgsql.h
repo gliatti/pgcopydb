@@ -364,9 +364,11 @@ bool pgsql_set_gucs(PGSQL *pgsql, GUC *settings);
 
 bool pg_copy_large_object(PGSQL *src,
 						  PGSQL *dst,
+						  bool dropIfExists,
 						  bool restoreOwner,
 						  uint32_t oid,
 						  const char *rolname,
+						  bool *skipped,
 						  uint64_t *bytesTransmitted);
 
 bool pg_copy_large_object_metadata(PGSQL *src,

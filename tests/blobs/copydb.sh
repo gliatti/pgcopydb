@@ -93,6 +93,21 @@ test "${count}" = "0"
 
 pgcopydb copy blobs --large-objects-jobs 2 --resume
 
+# by default, large objects that already exist on the target are skipped
+# entirely: alter a comment on the target, run the copy again, and check
+# that our local change is still there (the large object was not copied)
+psql -d ${PGCOPYDB_TARGET_PGURI} -1 -c "comment on large object ${loid1} is 'locally modified';"
+
+pgcopydb copy blobs --large-objects-jobs 2 --resume
+
+comment=$(psql -AXqt -d ${PGCOPYDB_TARGET_PGURI} -c "select obj_description(${loid1}, 'pg_largeobject')")
+test "${comment}" = "locally modified"
+
+# with --drop-if-exists, existing large objects are dropped and copied all
+# over again: the source comment is restored, as checked by the final
+# metadata diff below
+pgcopydb copy blobs --large-objects-jobs 2 --resume --drop-if-exists
+
 pgcopydb restore post-data --resume
 
 pgcopydb list progress --summary

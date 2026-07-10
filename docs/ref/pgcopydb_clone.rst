@@ -90,6 +90,10 @@ The ``pgcopydb clone`` command implements the following steps:
      section: instead the large objects are created concurrently by the
      worker sub-processes.
 
+     Large objects that already exist on the target database are skipped
+     entirely, which saves time when resuming a previous run; when using
+     ``--drop-if-exists`` they are dropped and copied all over again.
+
   6. As many as ``--index-jobs`` CREATE INDEX sub-processes are started to
      share the workload and build indexes. In order to make sure to start
      the CREATE INDEX commands only after the COPY operation has completed,

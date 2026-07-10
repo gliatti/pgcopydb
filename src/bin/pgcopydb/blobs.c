@@ -365,6 +365,7 @@ copydb_blob_worker(CopyDataSpec *specs)
 	PGSQL *src = &(specs->sourceSnapshot.pgsql);
 	PGSQL dst = { 0 };
 
+	bool dropIfExists = specs->restoreOptions.dropIfExists;
 	bool restoreOwner = !specs->restoreOptions.noOwner;
 	bool noACL = specs->restoreOptions.noACL;
 	bool noComments = specs->restoreOptions.noComments;
@@ -425,10 +426,14 @@ copydb_blob_worker(CopyDataSpec *specs)
 				instr_time startTime;
 				INSTR_TIME_SET_CURRENT(startTime);
 
+				bool skipped = false;
+
 				if (!pg_copy_large_object(src, &dst,
+										  dropIfExists,
 										  restoreOwner,
 										  mesg.data.lo.oid,
 										  mesg.data.lo.rolname,
+										  &skipped,
 										  &bytesTransmitted))
 				{
 					log_error("Failed to copy Large Object with oid %u, "
@@ -437,7 +442,8 @@ copydb_blob_worker(CopyDataSpec *specs)
 					return false;
 				}
 
-				if (!pg_copy_large_object_metadata(src, &dst,
+				if (!skipped &&
+					!pg_copy_large_object_metadata(src, &dst,
 												   noACL,
 												   noComments,
 												   mesg.data.lo.oid))

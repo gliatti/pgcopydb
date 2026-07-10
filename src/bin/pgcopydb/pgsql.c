@@ -3497,9 +3497,14 @@ pgsql_set_gucs(PGSQL *pgsql, GUC *settings)
  * objects on both sides.
  *
  * The schema dump is done with `pg_dump --no-blobs` so the large objects are
- * never created by the pre-data section of the dump: this function always
- * creates the large object on the target database, dropping it first when it
- * already exists (e.g. when resuming a previous run).
+ * never created by the pre-data section of the dump: this function creates
+ * the large object on the target database itself.
+ *
+ * When the large object already exists on the target database, the behaviour
+ * depends on dropIfExists: when true the target large object is dropped and
+ * created again (overwrite/update); when false the large object is entirely
+ * skipped (skipped is set to true and neither its data nor its metadata are
+ * copied), which saves time when resuming a previous run.
  *
  * When restoreOwner is true and rolname is a non-empty (already quoted)
  * identifier, the large object ownership is also restored on the target:
@@ -3509,15 +3514,106 @@ pgsql_set_gucs(PGSQL *pgsql, GUC *settings)
 bool
 pg_copy_large_object(PGSQL *src,
 					 PGSQL *dst,
+					 bool dropIfExists,
 					 bool restoreOwner,
 					 uint32_t blobOid,
 					 const char *rolname,
+					 bool *skipped,
 					 uint64_t *bytesTransmitted)
 {
 	log_debug("Copying large object %u", blobOid);
 
+	*skipped = false;
+
+	char sql[BUFSIZE] = { 0 };
+
 	/*
-	 * 1. Open the blob on the source database
+	 * 1. Drop or skip the blob on the target database.
+	 *
+	 *    The large objects are not part of the schema dump (--no-blobs),
+	 *    so we create the target large object ourselves. When it already
+	 *    exists on the target (e.g. when resuming a previous run, or when
+	 *    the target database already had that OID in use), --drop-if-exists
+	 *    drops it first to copy it all over again; the default is to skip
+	 *    the large object entirely.
+	 *
+	 *    Calling lo_unlink() on a missing blob would reach
+	 *    LargeObjectDrop() which calls ereport(ERROR), aborting the
+	 *    transaction.  Instead, use a WHERE-filtered SELECT so that
+	 *    lo_unlink() is only called when the row actually exists.  This
+	 *    is the same pattern used by pg_restore's own DropLOIfExists().
+	 */
+	if (dropIfExists)
+	{
+		sformat(sql, sizeof(sql),
+				"SELECT lo_unlink(oid) "
+				"FROM pg_largeobject_metadata "
+				"WHERE oid = %u",
+				blobOid);
+
+		if (!pgsql_execute(dst, sql))
+		{
+			log_error("Failed to delete large object %u", blobOid);
+
+			pgsql_finish(src);
+			pgsql_finish(dst);
+			return false;
+		}
+	}
+	else
+	{
+		SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+		sformat(sql, sizeof(sql),
+				"SELECT EXISTS("
+				"SELECT 1 FROM pg_largeobject_metadata WHERE oid = %u"
+				")",
+				blobOid);
+
+		if (!pgsql_execute_with_params(dst, sql, 0, NULL, NULL,
+									   &context, &parseSingleValueResult) ||
+			!context.parsedOk)
+		{
+			log_error("Failed to check existence of large object %u on target",
+					  blobOid);
+
+			pgsql_finish(src);
+			pgsql_finish(dst);
+			return false;
+		}
+
+		if (context.boolVal)
+		{
+			log_debug("Skipping large object %u, it already exists on target",
+					  blobOid);
+
+			*skipped = true;
+			return true;
+		}
+	}
+
+	/*
+	 * 2. Create the blob on the target database, re-using the same OID.
+	 */
+	Oid dstBlobOid = lo_create(dst->connection, blobOid);
+
+	if (dstBlobOid != blobOid)
+	{
+		char context[BUFSIZE] = { 0 };
+
+		sformat(context, sizeof(context),
+				"Failed to create large object %u", blobOid);
+
+		(void) pgcopy_log_error(dst, NULL, context);
+
+		pgsql_finish(src);
+		pgsql_finish(dst);
+
+		return false;
+	}
+
+	/*
+	 * 3. Open the blob on the source database.
 	 */
 	int srcfd = lo_open(src->connection, blobOid, INV_READ);
 
@@ -3537,58 +3633,7 @@ pg_copy_large_object(PGSQL *src,
 	}
 
 	/*
-	 * 2. Drop/Create the blob on the target database.
-	 *
-	 *    The large objects are not part of the schema dump (--no-blobs),
-	 *    so we always create the target large object ourselves, dropping
-	 *    it first when it already exists (e.g. when resuming a previous
-	 *    run, or when the target database already had that OID in use).
-	 *
-	 *    Calling lo_unlink() on a missing blob would reach
-	 *    LargeObjectDrop() which calls ereport(ERROR), aborting the
-	 *    transaction.  Instead, use a WHERE-filtered SELECT so that
-	 *    lo_unlink() is only called when the row actually exists.  This
-	 *    is the same pattern used by pg_restore's own DropLOIfExists().
-	 */
-	char sql[BUFSIZE] = { 0 };
-
-	sformat(sql, sizeof(sql),
-			"SELECT lo_unlink(oid) "
-			"FROM pg_largeobject_metadata "
-			"WHERE oid = %u",
-			blobOid);
-
-	if (!pgsql_execute(dst, sql))
-	{
-		log_error("Failed to delete large object %u", blobOid);
-
-		lo_close(src->connection, srcfd);
-		pgsql_finish(src);
-		pgsql_finish(dst);
-		return false;
-	}
-
-	Oid dstBlobOid = lo_create(dst->connection, blobOid);
-
-	if (dstBlobOid != blobOid)
-	{
-		char context[BUFSIZE] = { 0 };
-
-		sformat(context, sizeof(context),
-				"Failed to create large object %u", blobOid);
-
-		(void) pgcopy_log_error(dst, NULL, context);
-
-		lo_close(src->connection, srcfd);
-
-		pgsql_finish(src);
-		pgsql_finish(dst);
-
-		return false;
-	}
-
-	/*
-	 * 3. Open the blob on the target database, it was just created.
+	 * 4. Open the blob on the target database, it was just created.
 	 */
 	int dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
 
@@ -3610,7 +3655,7 @@ pg_copy_large_object(PGSQL *src,
 	}
 
 	/*
-	 * 4. Read the large object content in chunks on the source
+	 * 5. Read the large object content in chunks on the source
 	 *    database, and write them on the target database.
 	 */
 	int bytesRead = 0;
@@ -3686,7 +3731,7 @@ pg_copy_large_object(PGSQL *src,
 	lo_close(dst->connection, dstfd);
 
 	/*
-	 * 5. Restore the large object ownership on the target.
+	 * 6. Restore the large object ownership on the target.
 	 *
 	 *    We created the large object above via lo_create() and it is
 	 *    therefore owned by the connecting role.
