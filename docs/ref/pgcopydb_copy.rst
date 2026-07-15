@@ -145,10 +145,23 @@ pgcopydb copy blobs
 pgcopydb copy blobs - Copy the blob data from the source database to the target
 
 The command ``pgcopydb copy blobs`` fetches list of large objects (aka
-blobs) from the source database and copies their data parts to the target
-database. By default the command assumes that the large objects metadata
-have already been taken care of, because of the behaviour of
-``pg_dump --section=pre-data``.
+blobs) from the source database and copies them to the target database. The
+large objects are created on the target database (re-using the same OID as
+on the source database), then their data parts are copied over, and finally
+their metadata (owner, ACL, and comment) is copied too, honoring the
+``--no-owner``, ``--no-acl``, and ``--no-comments`` options. Security
+labels on large objects are not copied.
+
+When a large object already exists on the target database, it is entirely
+skipped (neither its data nor its metadata are copied), which saves time
+when resuming a previous run. Use ``--drop-if-exists`` to instead drop the
+existing large object and copy it all over again.
+
+As with ``pg_restore``, the owner and grantee roles referenced by the large
+objects metadata must already exist on the target database, otherwise the
+copy fails; the ``--no-owner`` and ``--no-acl`` options allow skipping that
+metadata. The ACL is re-created with the large object owner as the grantor,
+the same way a ``pg_dump`` script would.
 
 .. include:: ../include/copy-blobs.rst
 

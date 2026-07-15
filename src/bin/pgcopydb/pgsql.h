@@ -368,7 +368,14 @@ bool pg_copy_large_object(PGSQL *src,
 						  bool restoreOwner,
 						  uint32_t oid,
 						  const char *rolname,
+						  bool *skipped,
 						  uint64_t *bytesTransmitted);
+
+bool pg_copy_large_object_metadata(PGSQL *src,
+								   PGSQL *dst,
+								   bool noACL,
+								   bool noComments,
+								   uint32_t blobOid);
 
 /*
  * Maximum length of serialized pg_lsn value
