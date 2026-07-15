@@ -157,6 +157,12 @@ skipped (neither its data nor its metadata are copied), which saves time
 when resuming a previous run. Use ``--drop-if-exists`` to instead drop the
 existing large object and copy it all over again.
 
+As with ``pg_restore``, the owner and grantee roles referenced by the large
+objects metadata must already exist on the target database, otherwise the
+copy fails; the ``--no-owner`` and ``--no-acl`` options allow skipping that
+metadata. The ACL is re-created with the large object owner as the grantor,
+the same way a ``pg_dump`` script would.
+
 .. include:: ../include/copy-blobs.rst
 
 .. _pgcopydb_copy_sequences:

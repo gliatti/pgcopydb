@@ -22,6 +22,8 @@ typedef struct BlobMetadataArray
 	int count;
 	Oid oids[MAX_BLOB_PER_FETCH];
 	char rolnames[MAX_BLOB_PER_FETCH][PG_NAMEDATALEN];
+	bool hasACL[MAX_BLOB_PER_FETCH];
+	bool hasComment[MAX_BLOB_PER_FETCH];
 } BlobMetadataArray;
 
 typedef struct BlobMetadataArrayContext
@@ -385,6 +387,7 @@ copydb_blob_worker(CopyDataSpec *specs)
 
 	int errors = 0;
 	bool stop = false;
+	uint64_t skippedBlobs = 0;
 
 	while (!stop)
 	{
@@ -442,7 +445,21 @@ copydb_blob_worker(CopyDataSpec *specs)
 					return false;
 				}
 
-				if (!skipped &&
+				if (skipped)
+				{
+					++skippedBlobs;
+				}
+
+				/*
+				 * Only run the per-blob metadata query when the large object
+				 * actually has an ACL and/or a comment to copy, as advertised
+				 * in the queue message by the metadata producer process.
+				 */
+				bool copyMetadata =
+					(!noACL && mesg.data.lo.hasACL) ||
+					(!noComments && mesg.data.lo.hasComment);
+
+				if (!skipped && copyMetadata &&
 					!pg_copy_large_object_metadata(src, &dst,
 												   noACL,
 												   noComments,
@@ -496,6 +513,15 @@ copydb_blob_worker(CopyDataSpec *specs)
 		return false;
 	}
 
+	if (skippedBlobs > 0)
+	{
+		log_info("Large Objects worker %d skipped %lld large objects that "
+				 "already exist on the target database, "
+				 "consider --drop-if-exists to copy them again",
+				 pid,
+				 (long long) skippedBlobs);
+	}
+
 	bool success = (stop == true && errors == 0);
 
 	if (errors > 0)
@@ -515,12 +541,15 @@ copydb_blob_worker(CopyDataSpec *specs)
  * given blob.
  */
 bool
-copydb_add_blob(CopyDataSpec *specs, uint32_t oid, const char *rolname)
+copydb_add_blob(CopyDataSpec *specs, uint32_t oid, const char *rolname,
+				bool hasACL, bool hasComment)
 {
 	QMessage mesg = { .type = QMSG_TYPE_BLOBOID };
 
 	mesg.data.lo.oid = oid;
 	strlcpy(mesg.data.lo.rolname, rolname, sizeof(mesg.data.lo.rolname));
+	mesg.data.lo.hasACL = hasACL;
+	mesg.data.lo.hasComment = hasComment;
 
 	log_debug("copydb_add_blob(%d): %u", specs->loQueue.qId, oid);
 
@@ -593,11 +622,22 @@ copydb_queue_largeobject_metadata(CopyDataSpec *specs, uint64_t *count)
 
 	PGSQL *src = &(specs->sourceSnapshot.pgsql);
 
+	/*
+	 * Also fetch whether each large object has an ACL and/or a comment, so
+	 * that the workers only have to run the per-blob metadata query for the
+	 * (rare) large objects that actually have some metadata to copy.
+	 */
 	BlobMetadataArrayContext context = { 0 };
 	char *sql =
 		"DECLARE bloboid CURSOR FOR "
-		"SELECT oid, format('%I', pg_catalog.pg_get_userbyid(lomowner)) "
-		"FROM pg_largeobject_metadata ORDER BY 1";
+		"SELECT m.oid, "
+		"       format('%I', pg_catalog.pg_get_userbyid(m.lomowner)), "
+		"       m.lomacl IS NOT NULL, "
+		"       EXISTS(SELECT 1 FROM pg_catalog.pg_description d "
+		"               WHERE d.classoid = "
+		"                     'pg_catalog.pg_largeobject'::pg_catalog.regclass "
+		"                 AND d.objoid = m.oid) "
+		"FROM pg_largeobject_metadata m ORDER BY 1";
 
 	if (!pgsql_execute(src, sql))
 	{
@@ -638,7 +678,10 @@ copydb_queue_largeobject_metadata(CopyDataSpec *specs, uint64_t *count)
 		{
 			Oid blobOid = context.array.oids[i];
 
-			if (!copydb_add_blob(specs, blobOid, context.array.rolnames[i]))
+			if (!copydb_add_blob(specs, blobOid,
+								 context.array.rolnames[i],
+								 context.array.hasACL[i],
+								 context.array.hasComment[i]))
 			{
 				log_error("Failed to queue Large Object %u, "
 						  "see above for details",
@@ -670,9 +713,9 @@ parseBlobMetadataArray(void *ctx, PGresult *result)
 {
 	BlobMetadataArrayContext *context = (BlobMetadataArrayContext *) ctx;
 
-	if (PQnfields(result) != 2)
+	if (PQnfields(result) != 4)
 	{
-		log_error("Query returned %d columns, expected 2", PQnfields(result));
+		log_error("Query returned %d columns, expected 4", PQnfields(result));
 		context->parsedOk = false;
 		return;
 	}
@@ -695,5 +738,8 @@ parseBlobMetadataArray(void *ctx, PGresult *result)
 
 		strlcpy(context->array.rolnames[i], rolname,
 				sizeof(context->array.rolnames[i]));
+
+		context->array.hasACL[i] = (*PQgetvalue(result, i, 2)) == 't';
+		context->array.hasComment[i] = (*PQgetvalue(result, i, 3)) == 't';
 	}
 }

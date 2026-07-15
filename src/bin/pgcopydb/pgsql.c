@@ -3842,9 +3842,11 @@ pg_copy_large_object_metadata(PGSQL *src,
 		"             and d.objoid = m.oid "
 		" where m.oid = $1";
 
+	IntString blobOidString = intToString(blobOid);
+
 	int paramCount = 1;
 	const Oid paramTypes[1] = { OIDOID };
-	const char *paramValues[1] = { intToString(blobOid).strValue };
+	const char *paramValues[1] = { blobOidString.strValue };
 
 	if (!pgsql_execute_with_params(src, sql,
 								   paramCount, paramTypes, paramValues,
